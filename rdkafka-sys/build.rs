@@ -73,18 +73,8 @@ fn main() {
                 process::exit(1);
             }
         }
-    } else if env::var("CARGO_FEATURE_STATIC_EXTERNAL").is_ok() {
-        if let Ok(rdkafka_dir) = env::var("DEP_LIBRDKAFKA_STATIC_ROOT") {
-            println!("cargo:rustc-link-search=native={}/src", rdkafka_dir);
-            println!("cargo:rustc-link-lib=static=rdkafka");
-            println!("cargo:root={}", rdkafka_dir);
-        } else {
-            eprintln!(
-                "Path to DEP_LIBRDKAFKA_STATIC_ROOT not set. Static linking failed. Exiting."
-            );
-            process::exit(1);
-        }
-        eprintln!("librdkafka will be linked statically using prebuilt binaries");
+    } else if env::var("CARGO_FEATURE_STATIC_LINKING").is_ok() {
+        link_prebuilt_static();
     } else {
         // Ensure that we are in the right directory
         let rdkafkasys_root = Path::new("rdkafka-sys");
@@ -98,6 +88,93 @@ fn main() {
         eprintln!("Building and linking librdkafka statically");
         build_librdkafka();
     }
+}
+
+/// Links a librdkafka that was built outside this crate.
+///
+/// `DEP_LIBRDKAFKA_STATIC_ROOT` names an install tree directly. Without it the
+/// library is discovered with pkg-config, which is the only path that also
+/// emits librdkafka's own dependencies: a prebuilt archive from a distribution
+/// leaves `lz4`, `curl`, `sasl2` and the compression and TLS libraries
+/// undefined, and the caller has no other way to learn which ones this build
+/// needs.
+fn link_prebuilt_static() {
+    if let Ok(rdkafka_dir) = env::var("DEP_LIBRDKAFKA_STATIC_ROOT") {
+        // mklove leaves librdkafka.a in `src/`; a packaged install puts it in
+        // `lib/`. Search the directory itself as well so both layouts work.
+        println!("cargo:rustc-link-search=native={}/src", rdkafka_dir);
+        println!("cargo:rustc-link-search=native={}", rdkafka_dir);
+        println!("cargo:rustc-link-lib=static=rdkafka");
+        println!("cargo:root={}", rdkafka_dir);
+        eprintln!("librdkafka will be linked statically from {}", rdkafka_dir);
+        return;
+    }
+
+    // `rdkafka-static.pc` carries the dependency list in Libs.private; plain
+    // `rdkafka.pc` describes the shared library and may not.
+    //
+    // cargo_metadata is off because the .pc may name the archive by absolute
+    // path rather than `-lrdkafka`, and pkg-config's own emission turns that
+    // into a bare `-l` — which links the shared library when both sit in the
+    // same directory. librdkafka is emitted as `static` here instead.
+    for name in ["rdkafka-static", "rdkafka"] {
+        let probe = pkg_config::Config::new()
+            .cargo_metadata(false)
+            .statik(true)
+            .probe(name);
+        match probe {
+            Ok(library) => {
+                eprintln!(
+                    "librdkafka will be linked statically via pkg-config {} {}",
+                    name, library.version
+                );
+                for dir in &library.link_paths {
+                    println!("cargo:rustc-link-search=native={}", dir.display());
+                }
+                // A system directory is excluded even when it holds an
+                // archive: glibc ships libm.a and libpthread.a, and linking
+                // those statically is not what a caller asking for a static
+                // librdkafka wants. Mirrors pkg_config's own rule.
+                let system_roots = if cfg!(target_os = "macos") {
+                    vec![PathBuf::from("/Library"), PathBuf::from("/System")]
+                } else {
+                    vec![env::var_os("PKG_CONFIG_SYSROOT_DIR")
+                        .or_else(|| env::var_os("SYSROOT"))
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("/usr"))]
+                };
+                println!("cargo:rustc-link-lib=static=rdkafka");
+                for lib in &library.libs {
+                    if lib == "rdkafka" {
+                        continue;
+                    }
+                    // Link a dependency statically only where an archive sits
+                    // beside the library. This keeps libc and friends dynamic.
+                    let archive = format!("lib{}.a", lib);
+                    let has_archive = library.link_paths.iter().any(|dir| {
+                        dir.join(&archive).exists()
+                            && !system_roots.iter().any(|root| dir.starts_with(root))
+                    });
+                    if has_archive {
+                        println!("cargo:rustc-link-lib=static={}", lib);
+                    } else {
+                        println!("cargo:rustc-link-lib={}", lib);
+                    }
+                }
+                if let Some(root) = library.link_paths.first() {
+                    println!("cargo:root={}", root.display());
+                }
+                return;
+            }
+            Err(err) => eprintln!("pkg-config could not find {}: {}", name, err),
+        }
+    }
+
+    eprintln!(
+        "Static linking failed: set DEP_LIBRDKAFKA_STATIC_ROOT, or put \
+         rdkafka-static.pc on PKG_CONFIG_PATH. Exiting."
+    );
+    process::exit(1);
 }
 
 fn needs_curl() -> bool {
