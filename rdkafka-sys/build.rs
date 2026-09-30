@@ -112,55 +112,13 @@ fn link_prebuilt_static() {
 
     // `rdkafka-static.pc` carries the dependency list in Libs.private; plain
     // `rdkafka.pc` describes the shared library and may not.
-    //
-    // cargo_metadata is off because the .pc may name the archive by absolute
-    // path rather than `-lrdkafka`, and pkg-config's own emission turns that
-    // into a bare `-l` — which links the shared library when both sit in the
-    // same directory. librdkafka is emitted as `static` here instead.
     for name in ["rdkafka-static", "rdkafka"] {
-        let probe = pkg_config::Config::new()
-            .cargo_metadata(false)
-            .statik(true)
-            .probe(name);
-        match probe {
+        match pkg_config::Config::new().statik(true).probe(name) {
             Ok(library) => {
                 eprintln!(
                     "librdkafka will be linked statically via pkg-config {} {}",
                     name, library.version
                 );
-                for dir in &library.link_paths {
-                    println!("cargo:rustc-link-search=native={}", dir.display());
-                }
-                // A system directory is excluded even when it holds an
-                // archive: glibc ships libm.a and libpthread.a, and linking
-                // those statically is not what a caller asking for a static
-                // librdkafka wants. Mirrors pkg_config's own rule.
-                let system_roots = if cfg!(target_os = "macos") {
-                    vec![PathBuf::from("/Library"), PathBuf::from("/System")]
-                } else {
-                    vec![env::var_os("PKG_CONFIG_SYSROOT_DIR")
-                        .or_else(|| env::var_os("SYSROOT"))
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| PathBuf::from("/usr"))]
-                };
-                println!("cargo:rustc-link-lib=static=rdkafka");
-                for lib in &library.libs {
-                    if lib == "rdkafka" {
-                        continue;
-                    }
-                    // Link a dependency statically only where an archive sits
-                    // beside the library. This keeps libc and friends dynamic.
-                    let archive = format!("lib{}.a", lib);
-                    let has_archive = library.link_paths.iter().any(|dir| {
-                        dir.join(&archive).exists()
-                            && !system_roots.iter().any(|root| dir.starts_with(root))
-                    });
-                    if has_archive {
-                        println!("cargo:rustc-link-lib=static={}", lib);
-                    } else {
-                        println!("cargo:rustc-link-lib={}", lib);
-                    }
-                }
                 if let Some(root) = library.link_paths.first() {
                     println!("cargo:root={}", root.display());
                 }
